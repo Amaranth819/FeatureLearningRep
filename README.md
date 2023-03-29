@@ -6,6 +6,8 @@ Simple replication of some feature learning papers.
 
 Sohn, Kihyuk, Honglak Lee, and Xinchen Yan. "Learning structured output representation using deep conditional generative models." Advances in neural information processing systems 28 (2015).
 
+Generate examples with label
+
 ![cvae](./eval/cvae.png)
 
 
@@ -15,7 +17,11 @@ Ardizzone, Lynton, et al. "Analyzing inverse problems with invertible neural net
 
 ****(I didn't train for enough epochs.)****
 
+Forward (the point position -> label)
+
 ![Forward prediction](./eval/ForwardINN.png)
+
+Backward (label -> the point position)
 
 ![Backward prediction](./eval/BackwardINN.png)
 
@@ -23,5 +29,7 @@ Ardizzone, Lynton, et al. "Analyzing inverse problems with invertible neural net
 3. towards_kmeans_friendly.py - [Towards k-means-friendly spaces](http://proceedings.mlr.press/v70/yang17b/yang17b.pdf)
 
 Yang, Bo, et al. "Towards k-means-friendly spaces: Simultaneous deep learning and clustering." international conference on machine learning. PMLR, 2017.
+
+Cluster MNIST images without labels
 
 ![Clustering result](./eval/toward_kmeans.png)
