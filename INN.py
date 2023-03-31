@@ -5,6 +5,7 @@ import time
 from utils import create_mlp, Logger
 from dataset import create_GMM_dataset, onehot_to_label, visualize_GMM_data, label_to_onehot
 from itertools import count
+import tqdm 
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
@@ -71,13 +72,17 @@ class InvertibleBlock(nn.Module):
 
 
 
-class PermuteRandom(nn.Module):
-    def __init__(self, in_channels, seed = 123456) -> None:
+class Permute(nn.Module):
+    def __init__(self, in_channels, method = 'reverse') -> None:
         super().__init__()
 
-        np.random.seed(seed)
-        perm = np.random.permutation(in_channels)
-        # perm = np.arange(in_channels)
+        if method == 'reverse':
+            perm = np.arange(in_channels)
+        elif method == 'random':
+            perm = np.random.permutation(in_channels)
+        else:
+            raise ValueError
+
         perm_inv = np.zeros_like(perm)
         for i, p in enumerate(perm):
             perm_inv[p] = i
@@ -87,20 +92,22 @@ class PermuteRandom(nn.Module):
 
     
     def forward(self, x, reverse = False):
-        # Only support inputs of shape [bs, n]
-        return x[:, self.perm_inv] if reverse else x[:, self.perm], 0
-        
+        # Only support inputs of shape [..., n]
+        return x[..., self.perm_inv] if reverse else x[..., self.perm], 0
 
 
 
 class INN(nn.Module):
-    def __init__(self, in_dim, hidden_dim = 256, num_nodes = 3) -> None:
+    def __init__(self) -> None:
         super().__init__()
-
         self.nodes = []
-        for _ in range(num_nodes):
-            self.nodes.append(InvertibleBlock(in_dim, hidden_dim))
-            self.nodes.append(PermuteRandom(in_dim))
+
+
+    def append(self, block):
+        self.nodes.append(block)
+
+
+    def build(self):
         self.nodes = nn.ModuleList(self.nodes)
 
 
@@ -114,15 +121,12 @@ class INN(nn.Module):
 
 
     def forward(self, x, reverse = False):
+        log_det_J = 0
         for node in self.nodes[::-1 if reverse else 1]:
-            x, _ = node(x, reverse)
-        return x
-
-    
-    # def to(self, device):
-    #     for node in self.nodes:
-    #         node = node.to(device)
-    #     return self
+            x, log_val = node(x, reverse)
+            log_det_J += log_val
+        log_det_J_loss = -torch.sum(log_det_J)
+        return x, log_det_J_loss
 
 
 '''
@@ -175,9 +179,10 @@ def main(epochs = 10):
     # Generate dataset
     radius1 = 2.0
     radius2 = 0.15
-    batch_size = 2048
+    batch_size = 256
+    hidden_dim = 256
     num_classes = 8
-    trainset_size = 80000
+    trainset_size = 20000
     testset_size = 4000
     trainset_loader = create_GMM_dataset(trainset_size, num_classes, radius1, radius2, batch_size)
     testset_loader = create_GMM_dataset(testset_size, num_classes, radius1, radius2, testset_size)
@@ -200,17 +205,26 @@ def main(epochs = 10):
     ], -1)
 
     # Create network
-    hidden_dim = 512
-    num_nodes = 8
-    model = INN(pad_ndim, hidden_dim, num_nodes).to(device)
+    model = INN()
+    model.append(InvertibleBlock(pad_ndim, hidden_dim))
+    model.append(Permute(pad_ndim))
+    model.append(InvertibleBlock(pad_ndim, hidden_dim))
+    model.append(Permute(pad_ndim))
+    model.append(InvertibleBlock(pad_ndim, hidden_dim))
+    model.build()
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.trainable_params(), lr = 1e-3, betas = (0.8, 0.9), eps = 1e-6, weight_decay = 2e-5)
-    # sd = torch.load('INN_exp/INN.pkl')
-    # model.load_state_dict(sd['model'])
-    # optimizer.load_state_dict(sd['optimizer'])
 
     # print(model)
-    total_steps = 0
-    for e in count(1):
+    bar = tqdm.tqdm(np.arange(epochs) + 1)
+    for e in bar:
+        loss_y_fit_forward_list = []
+        loss_yz_MMD_forward_list = []
+        loss_forward_list = []
+        loss_x_MMD_backward_list = []
+        loss_x_fit_backward_list = []
+        loss_backward_list = []
+
         for batch_idx, (x, y) in enumerate(trainset_loader):
             x, y = x.to(device), y.to(device)
             onehot_y = label_to_onehot(y, num_classes)
@@ -227,7 +241,7 @@ def main(epochs = 10):
             optimizer.zero_grad()
 
             # Forward
-            output = model(pad_x)
+            output, _ = model(pad_x)
             loss_y_fit_forward = 3. * fit_loss(output[:, z_ndim:], pad_y[:, z_ndim:])
             output_block_grad = torch.cat([output[:, :z_ndim], output[:, -y_ndim:].data], -1)
             pad_y_short = torch.cat([z, noise_y], -1)
@@ -241,8 +255,8 @@ def main(epochs = 10):
             perturb_output_z = noise_func(output.data[:, :z_ndim], label_noise_scale)
             y_rev = torch.cat([perturb_output_z, pad3, noise_y2], -1)
             y_rev_rand = torch.cat([padding_func(onehot_y, z_ndim, 1), pad3, noise_y2], -1)
-            out_rev = model(y_rev, True)
-            out_rev_rand = model(y_rev_rand, True)
+            out_rev, _ = model(y_rev, True)
+            out_rev_rand, _ = model(y_rev_rand, True)
 
             loss_x_MMD_backward = 400 * min(1., 2. * 0.002**(1. - (float(e) / epochs))) * MMD_loss(out_rev_rand[:, :x_ndim], pad_x[:, :x_ndim])
             loss_x_fit_backward = 3 * fit_loss(out_rev, pad_x)
@@ -254,39 +268,48 @@ def main(epochs = 10):
             
             optimizer.step()
 
-            log_dict = {
-                'loss_y_fit_forward' : loss_y_fit_forward.item(),
-                'loss_yz_MMD_forward' : loss_yz_MMD_forward.item(),
-                'loss_forward' : loss_forward.item(),
-                'loss_x_MMD_backward' : loss_x_MMD_backward.item(),
-                'loss_x_fit_backward' : loss_x_fit_backward.item(),
-                'loss_backward' : loss_backward.item(),
-            }
-            total_steps += 1
-            log.add(total_steps, log_dict, 'Train')
-            print('Epoch %d | Batch %d:' % (e, batch_idx) + ''.join([' %s=%.4f' % (tag, val) for tag, val in log_dict.items()]))
+            loss_y_fit_forward_list.append(loss_y_fit_forward.item())
+            loss_yz_MMD_forward_list.append(loss_yz_MMD_forward.item())
+            loss_forward_list.append(loss_forward.item())
+            loss_x_fit_backward_list.append(loss_x_fit_backward.item())
+            loss_x_MMD_backward_list.append(loss_x_MMD_backward.item())
+            loss_backward_list.append(loss_backward.item())
 
+        forward_loss_log = {
+            'y_fit' : np.mean(loss_y_fit_forward_list),
+            'yz_MMD' : np.mean(loss_yz_MMD_forward_list),
+            'total' : np.mean(loss_forward_list)
+        }
+        backward_loss_log = {
+            'x_fit' : np.mean(loss_x_fit_backward_list),
+            'x_MMD' : np.mean(loss_x_MMD_backward_list),
+            'total' : np.mean(loss_backward_list)
+        }
+
+        log.add(e, forward_loss_log, 'Forward')
+        log.add(e, backward_loss_log, 'Backward')
+        bar.set_description(f'Epoch {e}| Forward -' + ''.join([' %s=%.4f' % (tag, val) for tag, val in forward_loss_log.items()]) + ' | Backward -' + ''.join([' %s=%.4f' % (tag, val) for tag, val in backward_loss_log.items()]))
 
         # Test
-        with torch.no_grad():
-            rev_x = model(pad_testset_onehot, True)[:, :x_ndim].cpu().numpy()
-            pred_onehots = model(torch.cat([testset_x, padding_func(testset_x, pad_ndim - x_ndim, 0)], -1))[:, -y_ndim:]
-            pred_labels = onehot_to_label(pred_onehots).cpu().numpy()
+        if e % 10 == 0:
+            with torch.no_grad():
+                rev_x, _ = model(pad_testset_onehot, True)
+                rev_x = rev_x[..., :x_ndim].cpu().numpy()
+                pred_onehots, _ = model(torch.cat([testset_x, padding_func(testset_x, pad_ndim - x_ndim, 0)], -1))
+                pred_onehots = pred_onehots[..., -y_ndim:]
+                pred_labels = onehot_to_label(pred_onehots).cpu().numpy()
 
-            pred_res = pred_labels == testset_y.cpu().numpy()
-            pred_accuracy = np.sum(pred_res) / pred_res.shape[0]
-            log.add(e, {'Pred Accuracy' : pred_accuracy}, 'Eval')
-            print('Epoch %d: Pred Accuracy = %.4f' % (e, pred_accuracy))
+                pred_res = pred_labels == testset_y.cpu().numpy()
+                pred_accuracy = np.sum(pred_res) / pred_res.shape[0]
+                log.add(e, {'Pred Accuracy' : pred_accuracy}, 'Eval')
+                print('Epoch %d: Pred Accuracy = %.4f' % (e, pred_accuracy))
 
-        visualize_GMM_data(testset_x.cpu().numpy(), pred_labels, num_classes, log_dir + 'Forward_epoch%d.png' % e)
-        visualize_GMM_data(rev_x, testset_y.cpu().numpy(), num_classes, log_dir + 'Backward_epoch%d.png' % e)
-
-        if e >= epochs:
-            break
+            visualize_GMM_data(testset_x.cpu().numpy(), pred_labels, num_classes, log_dir + 'Forward_epoch%d.png' % e)
+            visualize_GMM_data(rev_x, testset_y.cpu().numpy(), num_classes, log_dir + 'Backward_epoch%d.png' % e)
 
     log.close()
     torch.save({'model' : model.state_dict(), 'optimizer' : optimizer.state_dict()}, log_dir + 'INN.pkl')
 
 
 if __name__ == '__main__':
-    main(epochs = 80)
+    main(epochs = 50)
