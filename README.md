@@ -15,8 +15,6 @@ Generate examples with label
 
 Ardizzone, Lynton, et al. "Analyzing inverse problems with invertible neural networks." arXiv preprint arXiv:1808.04730 (2018).
 
-****(I didn't train for enough epochs.)****
-
 Forward (the point position -> label)
 
 ![Forward prediction](./eval/ForwardINN.png)
